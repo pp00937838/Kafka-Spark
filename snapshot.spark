@@ -1,0 +1,95 @@
+[config]
+  docker_tag=v0.1.100
+  executor_memory=1024m
+  executor_cores=2
+---
+from pyspark import SparkConf
+from pyspark.sql import functions as F  # noqa: N812
+from pyspark.sql.functions import from_unixtime
+from pyspark.sql.types import DoubleType, IntegerType, LongType, StructField, StructType, TimestampType
+
+from core_data.streaming.columns import MetaColumnHandler
+from core_data.streaming.utils import upsert_to_datastore
+from core_data.utils.config import (
+    HiveMetastoreConfig,
+    KafkaConfig,
+    S3Config,
+    StreamingTriggerConfig,
+    openlineage_config,
+)
+from core_data.utils.spark.common import (
+    get_spark_session_context_with_listeners,
+    set_s3_access_config_in_spark_conf,
+)
+from core_data.utils.spark.iceberg import set_iceberg_config_in_spark_conf
+from core_data.utils.spark.kafka import read_kafka_stream, set_kafka_in_spark_conf
+from core_data.utils.spark.openlineage import set_openlineage_config_in_spark_conf
+from core_data.utils.spark.stream import get_checkpoint_location, write_stream
+
+output_table = "neos.fleet_mgmt_location_events_snap"
+
+s3_config = S3Config.from_env()
+hive_metastore_config = HiveMetastoreConfig.from_env()
+
+spark_conf = set_iceberg_config_in_spark_conf(SparkConf(), s3_config, hive_metastore_config)
+spark_conf = set_kafka_in_spark_conf(spark_conf)
+spark_conf = set_s3_access_config_in_spark_conf(spark_conf, s3_config)
+spark_conf = set_openlineage_config_in_spark_conf(
+    spark_conf,
+    job_identifier=output_table,
+    config=openlineage_config,
+)
+
+spark, sql_context = get_spark_session_context_with_listeners(
+    app_name="Fleet Management Location streaming application (Snap.)",
+    spark_conf=spark_conf,
+)
+
+kafka_config = KafkaConfig.from_env()
+
+trigger_config = StreamingTriggerConfig.from_env()
+
+checkpoint_location = get_checkpoint_location(spark, output_table)
+
+payload_schema = StructType(
+    [
+        StructField("vehicle_id", IntegerType(), True),
+        StructField(
+            "location",
+            StructType(
+                [
+                    StructField("latitude", DoubleType(), True),
+                    StructField("longitude", DoubleType(), True),
+                ],
+            ),
+            True,
+        ),
+        StructField("ts", LongType(), True),
+    ],
+)
+
+input_df = read_kafka_stream(spark, kafka_config, payload_schema, include_internal_columns=True)
+
+payload_df = input_df.select(
+    F.col("value.vehicle_id").alias("vehicle_id"),
+    F.col("value.location.latitude").alias("latitude"),
+    F.col("value.location.longitude").alias("longitude"),
+    from_unixtime(F.col("value.ts"), "yyyy-MM-dd HH:mm:ss").cast(TimestampType()).alias("ts"),
+).transform(MetaColumnHandler.add_seq_no(F.col("ts")))
+
+write_stream(
+    df=payload_df,
+    checkpoint_location=checkpoint_location,
+    trigger_config=trigger_config,
+    func=(
+        lambda batch_df, batch_id: upsert_to_datastore(
+            df=batch_df,
+            batch_id=batch_id,
+            table_name=output_table,
+            keys=["vehicle_id"],
+            sequence_column=MetaColumnHandler.SEQ_NO_COLUMN,
+        )
+    ),
+)
+
+spark.stop()
